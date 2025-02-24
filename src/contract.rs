@@ -77,8 +77,9 @@ pub fn execute(
         ExecuteMsg::FundCooperative {
             cooperative_name,
             token,
+            is_native,
             amount,
-        } => execute_fund_cooperative(deps, env, info, cooperative_name, token, amount),
+        } => execute_fund_cooperative(deps, env, info, cooperative_name, token, is_native, amount),
         ExecuteMsg::Borrow {
             cooperative_name,
             tokens_in,
@@ -125,7 +126,7 @@ pub fn execute(
 }
 
 pub mod execute {
-    use cosmwasm_std::Timestamp;
+    use cosmwasm_std::{StdError, Timestamp};
     use cw20::Cw20ExecuteMsg;
 
     use crate::state::{Price, REWARDS_POOLS};
@@ -174,6 +175,7 @@ pub mod execute {
         initial_members: Vec<Member>, //max 20 initial members
         initial_whitelisted_tokens: Vec<WhitelistedToken>, // max 5 whitelisted tokens,
     ) -> Result<Response, ContractError> {
+        let name = name.trim().to_lowercase();
         // Check if cooperative already exists
         if COOPERATIVES.has(deps.storage, name.clone()) {
             return Err(ContractError::CooperativeAlreadyExists {});
@@ -230,21 +232,40 @@ pub mod execute {
         info: MessageInfo,
         cooperative_name: String,
         token: String,
+        is_native: bool,
         amount: Uint128,
     ) -> Result<Response, ContractError> {
         let cooperative_name = cooperative_name.trim().to_lowercase();
         let mut cooperative = COOPERATIVES.load(deps.storage, cooperative_name.clone())?;
-        let coin = info
-            .funds
-            .iter()
-            .find(|coin| coin.denom == token)
-            .ok_or(ContractError::NoFunds {})?;
+        let token_idx;
+        let mut messages: Vec<CosmosMsg> = vec![];
 
-        // Validate token is whitelisted
-        let token_idx = cooperative
-            .whitelisted_tokens
-            .iter()
-            .position(|x| x.denom == coin.denom);
+        // Validate transfer
+        if is_native {
+            let coin = info
+                .funds
+                .iter()
+                .find(|coin| coin.denom == token)
+                .ok_or(ContractError::NoFunds {})?;
+
+            if coin.amount != amount {
+                return Err(ContractError::FundsMustMatchAmount {});
+            }
+
+            // Validate token is whitelisted
+            token_idx = cooperative
+                .whitelisted_tokens
+                .iter()
+                .position(|x| x.denom == coin.denom);
+        } else {
+            let validate_msg = validate_cw20(&deps.as_ref(), &env, &info, &token, amount)?;
+            token_idx = cooperative
+                .whitelisted_tokens
+                .iter()
+                .position(|x| x.contract_addr == Some(Addr::unchecked(&token)));
+
+            messages = [messages, validate_msg].concat();
+        }
 
         if token_idx.is_none() {
             return Err(ContractError::InvalidToken {});
@@ -258,17 +279,6 @@ pub mod execute {
         }
 
         let whitelisted_token = whitelisted_token.unwrap();
-        let sent_funds = info
-            .funds
-            .iter()
-            .find(|coin| coin.denom == token)
-            .ok_or(ContractError::NoFunds {})?;
-
-        if sent_funds.amount != amount {
-            return Err(ContractError::InvalidFundAmount {});
-        }
-
-        let mut messages: Vec<CosmosMsg> = vec![];
 
         // Handle token transfer based on type
         if whitelisted_token.is_native {
@@ -328,7 +338,14 @@ pub mod execute {
         }
 
         // Update cooperative total funds
-        cooperative.total_funds[token_idx].1 += amount;
+        let current_token_idx = STATE.load(deps.storage)?.current_whitelisted_token_id;
+        let fund = cooperative.total_funds.get(token_idx);
+
+        if fund.is_none() {
+            cooperative.total_funds.push((current_token_idx, amount));
+        } else {
+            cooperative.total_funds[token_idx].1 += amount;
+        };
 
         COOPERATIVES.save(deps.storage, cooperative_name.clone(), &cooperative)?;
 
@@ -354,6 +371,64 @@ pub mod execute {
             .add_attribute("cooperative", cooperative_name)
             .add_attribute("token", token)
             .add_attribute("amount", amount.to_string()))
+    }
+
+    fn validate_cw20(
+        deps: &Deps,
+        env: &Env,
+        info: &MessageInfo,
+        token_address: &str,
+        required_amount: Uint128,
+    ) -> StdResult<Vec<CosmosMsg>> {
+        // Query token balance
+        let balance: cw20::BalanceResponse = deps.querier.query_wasm_smart(
+            token_address,
+            &cw20::Cw20QueryMsg::Balance {
+                address: info.sender.to_string(),
+            },
+        )?;
+
+        // Check if user has sufficient balance
+        if balance.balance < required_amount {
+            return Err(StdError::generic_err(format!(
+                "Insufficient CW20 token balance. Required: {}, Balance: {}",
+                required_amount, balance.balance
+            )));
+        }
+
+        // Query allowance
+        let allowance: cw20::AllowanceResponse = deps.querier.query_wasm_smart(
+            token_address,
+            &cw20::Cw20QueryMsg::Allowance {
+                owner: info.sender.to_string(),
+                spender: env.contract.address.to_string(),
+            },
+        )?;
+
+        // Check if contract has sufficient allowance
+        if allowance.allowance < required_amount {
+            return Err(StdError::generic_err(format!(
+                "Insufficient CW20 token allowance. Required: {}, Allowance: {}",
+                required_amount, allowance.allowance
+            )));
+        }
+
+        // move funds to contract
+        let mut messages: Vec<CosmosMsg> = vec![];
+        messages.push(
+            WasmMsg::Execute {
+                contract_addr: token_address.to_string(),
+                msg: to_json_binary(&cw20::Cw20ExecuteMsg::TransferFrom {
+                    owner: info.sender.to_string(),
+                    recipient: env.contract.address.to_string(),
+                    amount: required_amount,
+                })?,
+                funds: vec![],
+            }
+            .into(),
+        );
+
+        Ok(messages)
     }
 
     pub fn execute_borrow(
@@ -1122,6 +1197,7 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::ListCooperatives { min, max } => {
             to_json_binary(&query::list_cooperative(deps, min, max)?)
         }
+        QueryMsg::GetTokenId { token } => to_json_binary(&query::get_token_id(deps, token)?),
     }
 }
 
@@ -1132,7 +1208,7 @@ pub mod query {
 
     use crate::msg::{
         GetCooperativeResponse, GetListCooperativesResponse, GetMemberInfoResponse,
-        GetProposalResponse, GetWhitelistedTokensResponse,
+        GetProposalResponse, GetTokenIdResponse, GetWhitelistedTokensResponse,
     };
 
     use super::*;
@@ -1223,75 +1299,13 @@ pub mod query {
 
         Ok(GetListCooperativesResponse { cooperatives })
     }
+
+    pub fn get_token_id(deps: Deps, token: String) -> StdResult<GetTokenIdResponse> {
+        let token_id = TOKENS.load(deps.storage, Addr::unchecked(token))?;
+
+        Ok(GetTokenIdResponse { token_id })
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use cosmwasm_std::coins;
-    use cosmwasm_std::testing::{message_info, mock_dependencies, mock_env};
-
-    #[test]
-    fn proper_initialization() {
-        let mut deps = mock_dependencies();
-
-        let msg = InstantiateMsg {};
-        let info = message_info(&Addr::unchecked("creator"), &coins(1000, "earth"));
-
-        // we can just call .unwrap() to assert this was a success
-        let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-        assert_eq!(0, res.messages.len());
-
-        // it worked, let's query the state
-        // let res = query(deps.as_ref(), mock_env(), QueryMsg::GetCount {}).unwrap();
-        // let value: GetCountResponse = from_json(&res).unwrap();
-        // assert_eq!(17, value.count);
-    }
-
-    #[test]
-    fn increment() {
-        let mut deps = mock_dependencies();
-
-        let msg = InstantiateMsg {};
-        let info = message_info(&Addr::unchecked("creator"), &coins(2, "token"));
-        let _res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // beneficiary can release it
-        // let info = mock_info("anyone", &coins(2, "token"));
-        // let msg = ExecuteMsg::Increment {};
-        // let _res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // // should increase counter by 1
-        // let res = query(deps.as_ref(), mock_env(), QueryMsg::GetCount {}).unwrap();
-        // let value: GetCountResponse = from_json(&res).unwrap();
-        // assert_eq!(18, value.count);
-    }
-
-    #[test]
-    fn reset() {
-        let mut deps = mock_dependencies();
-
-        let msg = InstantiateMsg {};
-        let info = message_info(&Addr::unchecked("creator"), &coins(2, "token"));
-        let _res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
-
-        // // beneficiary can release it
-        // let unauth_info = mock_info("anyone", &coins(2, "token"));
-        // let msg = ExecuteMsg::Reset { count: 5 };
-        // let res = execute(deps.as_mut(), mock_env(), unauth_info, msg);
-        // match res {
-        //     Err(ContractError::Unauthorized {}) => {}
-        //     _ => panic!("Must return unauthorized error"),
-        // }
-
-        // // only the original creator can reset the counter
-        // let auth_info = mock_info("creator", &coins(2, "token"));
-        // let msg = ExecuteMsg::Reset { count: 5 };
-        // let _res = execute(deps.as_mut(), mock_env(), auth_info, msg).unwrap();
-
-        // // should now be 5
-        // let res = query(deps.as_ref(), mock_env(), QueryMsg::GetCount {}).unwrap();
-        // let value: GetCountResponse = from_json(&res).unwrap();
-        // assert_eq!(5, value.count);
-    }
-}
+mod tests {}

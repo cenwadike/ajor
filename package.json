@@ -1,0 +1,27 @@
+{
+  "name": "ajor",
+  "version": "1.0.0",
+  "description": "This documentation provides an overview of the Corporative Lending System, explaining what it does, the structure of the code, and how to use it.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cenwadike/ajor.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/cenwadike/ajor/issues"
+  },
+  "homepage": "https://github.com/cenwadike/ajor#readme",
+  "dependencies": {
+    "@cosmjs/cosmwasm-stargate": "^0.33.0",
+    "@cosmjs/proto-signing": "^0.33.0",
+    "@cosmjs/stargate": "^0.33.0",
+    "dotenv": "^16.4.7"
+  }
+}

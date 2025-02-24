@@ -1,7 +1,10 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{Addr, Uint128};
 
-use crate::state::{Cooperative, CorporativeName, Member, Proposal, RiskProfile, WhitelistedToken};
+use crate::state::{
+    Cooperative, CorporativeName, Member, Proposal, RiskProfile, WhitelistedToken,
+    WhitelistedTokenId,
+};
 
 #[cw_serde]
 pub struct InstantiateMsg {}
@@ -21,6 +24,7 @@ pub enum ExecuteMsg {
     FundCooperative {
         cooperative_name: CorporativeName,
         token: String,
+        is_native: bool,
         amount: Uint128,
     },
     Borrow {
@@ -78,6 +82,9 @@ pub enum QueryMsg {
 
     #[returns(GetWhitelistedTokensResponse)]
     GetWhitelistedTokens { cooperative_name: CorporativeName },
+
+    #[returns(GetTokenIdResponse)]
+    GetTokenId { token: String },
 }
 
 #[cw_serde]
@@ -103,4 +110,9 @@ pub struct GetProposalResponse {
 #[cw_serde]
 pub struct GetWhitelistedTokensResponse {
     pub tokens: Vec<WhitelistedToken>,
+}
+
+#[cw_serde]
+pub struct GetTokenIdResponse {
+    pub token_id: WhitelistedTokenId,
 }

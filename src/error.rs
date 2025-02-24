@@ -27,6 +27,9 @@ pub enum ContractError {
     #[error("No Funds")]
     NoFunds {},
 
+    #[error("Funds Mus Match Amount")]
+    FundsMustMatchAmount {},
+
     #[error("Fund must match amount")]
     InvalidFundAmount {},
 
