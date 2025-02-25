@@ -36,7 +36,7 @@ pub fn instantiate(
 
     let state = State {
         owner: info.sender.clone(),
-        weight_token: "uatom".to_string(),
+        weight_token: "untrn".to_string(),
         total_corporatives: 0,
         total_pooled_funds: vec![],
         current_proposal_id: 0,
@@ -138,7 +138,7 @@ pub mod execute {
         env: Env,
         info: MessageInfo,
         token_addr: Addr,
-        usd_price: u128,
+        usd_price: Decimal,
     ) -> Result<Response, ContractError> {
         let state = STATE.load(deps.storage)?;
 
@@ -198,11 +198,10 @@ pub mod execute {
 
         /* -- Update storage --- */
         let mut state = STATE.load(deps.storage)?;
+        let current_token_idx = state.current_whitelisted_token_id + 1;
 
         // add whitelisted token to
         for token in initial_whitelisted_tokens {
-            let current_token_idx = state.current_whitelisted_token_id + 1;
-
             if !token.is_native {
                 TOKENS.save(
                     deps.storage,
@@ -216,7 +215,7 @@ pub mod execute {
 
         // update total cooperative
         state.total_corporatives += 1;
-        state.current_whitelisted_token_id += 1;
+        state.current_whitelisted_token_id = current_token_idx;
 
         COOPERATIVES.save(deps.storage, name.clone(), &cooperative)?;
         STATE.save(deps.storage, &state)?;
@@ -235,13 +234,14 @@ pub mod execute {
         is_native: bool,
         amount: Uint128,
     ) -> Result<Response, ContractError> {
+        // Normalize cooperative name
         let cooperative_name = cooperative_name.trim().to_lowercase();
         let mut cooperative = COOPERATIVES.load(deps.storage, cooperative_name.clone())?;
-        let token_idx;
         let mut messages: Vec<CosmosMsg> = vec![];
 
-        // Validate transfer
-        if is_native {
+        // Validate transfer and find token index
+        let token_idx = if is_native {
+            // Validate native token
             let coin = info
                 .funds
                 .iter()
@@ -252,46 +252,30 @@ pub mod execute {
                 return Err(ContractError::FundsMustMatchAmount {});
             }
 
-            // Validate token is whitelisted
-            token_idx = cooperative
+            // Find token in whitelist
+            cooperative
                 .whitelisted_tokens
                 .iter()
-                .position(|x| x.denom == coin.denom);
+                .position(|x| x.denom == coin.denom && x.is_native)
+                .ok_or(ContractError::InvalidToken {})?
         } else {
+            // Validate CW20 token
             let validate_msg = validate_cw20(&deps.as_ref(), &env, &info, &token, amount)?;
-            token_idx = cooperative
+            messages = [messages, validate_msg].concat();
+
+            // Find token in whitelist
+            cooperative
                 .whitelisted_tokens
                 .iter()
-                .position(|x| x.contract_addr == Some(Addr::unchecked(&token)));
+                .position(|x| !x.is_native && x.contract_addr == Some(Addr::unchecked(&token)))
+                .ok_or(ContractError::InvalidToken {})?
+        };
 
-            messages = [messages, validate_msg].concat();
-        }
+        // Get the whitelisted token (we know it exists now)
+        let whitelisted_token = &cooperative.whitelisted_tokens[token_idx];
 
-        if token_idx.is_none() {
-            return Err(ContractError::InvalidToken {});
-        }
-        let token_idx = token_idx.unwrap();
-
-        let whitelisted_token = cooperative.whitelisted_tokens.get(token_idx);
-
-        if whitelisted_token.is_none() {
-            return Err(ContractError::InvalidToken {});
-        }
-
-        let whitelisted_token = whitelisted_token.unwrap();
-
-        // Handle token transfer based on type
-        if whitelisted_token.is_native {
-            // For native tokens, verify sent funds
-            // Create bank transfer message
-            messages.push(CosmosMsg::Bank(BankMsg::Send {
-                to_address: env.contract.address.to_string(),
-                amount: vec![Coin {
-                    denom: token.clone(),
-                    amount,
-                }],
-            }));
-        } else {
+        // Handle token cw20 transfer
+        if !whitelisted_token.is_native {
             // For CW20 tokens
             let cw20_addr = whitelisted_token
                 .contract_addr
@@ -317,35 +301,36 @@ pub mod execute {
             .position(|m| m.address == info.sender)
             .ok_or(ContractError::MemberNotFound {})?;
 
-        //Update member contribution
-        let mut current_amount: Uint128 = Uint128::zero();
-        cooperative.members[member_idx]
+        // Update member contribution more efficiently
+        let token_id = token_idx as u64;
+        let contribution_idx = cooperative.members[member_idx]
             .contribution
             .iter()
-            .find(|x| x.0 == token_idx as u64)
-            .map(|x| {
-                current_amount = x.1.into();
-            });
+            .position(|(id, _)| *id == token_id);
 
-        current_amount = current_amount + amount;
-
-        cooperative.members[member_idx]
-            .contribution
-            .push((token_idx as u64, current_amount));
-        let member = cooperative.members.get(member_idx);
-        if member.is_none() {
-            return Err(ContractError::MemberNotFound {});
+        if let Some(idx) = contribution_idx {
+            // Update existing contribution
+            cooperative.members[member_idx].contribution[idx].1 += amount;
+        } else {
+            // Add new contribution
+            cooperative.members[member_idx]
+                .contribution
+                .push((token_id, amount));
         }
 
-        // Update cooperative total funds
-        let current_token_idx = STATE.load(deps.storage)?.current_whitelisted_token_id;
-        let fund = cooperative.total_funds.get(token_idx);
+        // Update cooperative total funds more efficiently
+        let fund_idx = cooperative
+            .total_funds
+            .iter()
+            .position(|(id, _)| *id == token_id);
 
-        if fund.is_none() {
-            cooperative.total_funds.push((current_token_idx, amount));
+        if let Some(idx) = fund_idx {
+            // Update existing fund
+            cooperative.total_funds[idx].1 += amount;
         } else {
-            cooperative.total_funds[token_idx].1 += amount;
-        };
+            // Add new fund
+            cooperative.total_funds.push((token_id, amount));
+        }
 
         COOPERATIVES.save(deps.storage, cooperative_name.clone(), &cooperative)?;
 
@@ -354,13 +339,14 @@ pub mod execute {
         let state_token_idx = state
             .total_pooled_funds
             .iter()
-            .position(|(id, _)| *id == token_idx as u64)
-            .unwrap_or_else(|| state.total_pooled_funds.len());
+            .position(|(id, _)| *id == token_id);
 
-        if state_token_idx == state.total_pooled_funds.len() {
-            state.total_pooled_funds.push((token_idx as u64, amount));
+        if let Some(idx) = state_token_idx {
+            // Update existing pooled funds
+            state.total_pooled_funds[idx].1 += amount;
         } else {
-            state.total_pooled_funds[state_token_idx].1 += amount;
+            // Add new pooled funds
+            state.total_pooled_funds.push((token_id, amount));
         }
 
         STATE.save(deps.storage, &state)?;
@@ -441,9 +427,15 @@ pub mod execute {
         token_out: Addr,
         min_amount_out: Uint128,
     ) -> Result<Response, ContractError> {
+        // Validate input arrays
+        if tokens_in.is_empty() || amount_in.is_empty() || tokens_in.len() != amount_in.len() {
+            return Err(ContractError::InvalidInput {});
+        }
+
+        // Normalize cooperative name
         let cooperative_name = cooperative_name.trim().to_lowercase();
         let mut cooperative = COOPERATIVES.load(deps.storage, cooperative_name.clone())?;
-        let state = STATE.load(deps.storage)?;
+        let mut state = STATE.load(deps.storage)?;
         let loan_id = state.current_loan_id;
 
         // Find member
@@ -453,83 +445,90 @@ pub mod execute {
             .position(|m| m.address == info.sender)
             .ok_or(ContractError::MemberNotFound {})?;
 
-        // Calculate amount out
-        let member = &mut cooperative.clone().members[member_idx];
-        let mut collateral_value: Uint128 = 0u128.into();
-        let mut amount_out: Uint128 = 0u128.into();
+        // Validate output token
+        let w_token_idx = cooperative
+            .whitelisted_tokens
+            .iter()
+            .position(|x| x.contract_addr == Some(token_out.clone()))
+            .ok_or(ContractError::InvalidToken {})?;
 
+        let w_token = &cooperative.whitelisted_tokens[w_token_idx];
+
+        // Calculate collateral value and amount out
+        let mut collateral_value: Uint128 = Uint128::zero();
+        let mut collateral_details: Vec<(u64, Uint128)> = Vec::new();
         let mut messages: Vec<CosmosMsg> = vec![];
 
-        let mut member_iter = member.clone();
-        let contribution = member_iter.contribution.iter_mut();
-        for (idx, (contribution_token_id, _)) in contribution.enumerate() {
-            for token in tokens_in.iter() {
-                let token_id = TOKENS.load(deps.storage, token.clone())?;
+        // Process each input token
+        for (idx, token) in tokens_in.iter().enumerate() {
+            let token_id = TOKENS.load(deps.storage, token.clone())?;
 
-                if contribution_token_id == &token_id {
-                    let c_value = PRICES.load(deps.storage, token_id)?;
+            // Find token in member's contributions
+            let contribution_idx = cooperative.members[member_idx]
+                .contribution
+                .iter()
+                .position(|x| x.0 == token_id)
+                .ok_or(ContractError::NoContribution {})?;
 
-                    collateral_value += c_value.latest_price_to_usd;
+            let available_amount = cooperative.members[member_idx].contribution[contribution_idx].1;
+            let requested_amount = amount_in[idx];
 
-                    let asset_price = PRICES.load(deps.storage, token_id)?;
-                    let a_value = amount_in[idx]
-                        * collateral_value
-                        * cooperative
-                            .risk_profile
-                            .collateralization_ratio
-                            .to_uint_floor();
-
-                    amount_out = a_value / asset_price.latest_price_to_usd;
-
-                    // update contribution to prevent double spending
-                    let token_idx = member
-                        .clone()
-                        .contribution
-                        .iter()
-                        .position(|x| x.0 == token_id);
-                    if token_idx.is_none() {
-                        return Err(ContractError::InvalidToken {});
-                    }
-
-                    let mut part = member.contribution[token_idx.unwrap()];
-                    part.1 -= part.1.checked_sub(amount_in[idx]).unwrap();
-                    cooperative.members[member_idx].contribution[token_idx.unwrap()] = part;
-                }
+            // Ensure member has enough of this token
+            if available_amount < requested_amount {
+                return Err(ContractError::InsufficientFunds {});
             }
+
+            // Get token price for valuation
+            let token_price = PRICES.load(deps.storage, token_id)?;
+            let token_value = requested_amount * token_price.latest_price_to_usd.to_uint_floor();
+
+            collateral_value += token_value;
+            collateral_details.push((token_id, requested_amount));
+
+            // Reduce member's contribution
+            cooperative.members[member_idx].contribution[contribution_idx].1 -= requested_amount;
         }
 
+        // Calculate amount out based on collateral value and risk profile
+        let token_out_id = TOKENS.load(deps.storage, token_out.clone())?;
+        let token_out_price = PRICES.load(deps.storage, token_out_id)?;
+
+        let loan_value = collateral_value
+            * cooperative
+                .risk_profile
+                .collateralization_ratio
+                .to_uint_floor();
+        let amount_out = loan_value / token_out_price.latest_price_to_usd.to_uint_floor();
+
+        // Ensure minimum amount out is met
         if amount_out < min_amount_out {
             return Err(ContractError::InsufficientCollateral {});
         }
 
         // Create new loan
-        let rate: u128 = cooperative.risk_profile.interest_rate.to_uint_ceil().into();
+        let interest_rate = cooperative.risk_profile.interest_rate.to_uint_ceil().u128() as u64;
         let loan = Loan {
             id: loan_id,
             amount: amount_out,
             token: token_out.clone(),
-            collaterals: tokens_in,
-            collaterals_amount: amount_in,
-            interest_rate: Decimal::percent(rate as u64),
+            collaterals: tokens_in.clone(),
+            collaterals_amount: amount_in.clone(),
+            interest_rate: Decimal::percent(interest_rate),
             status: LoanStatus::Active,
         };
 
-        let w_token_idx = cooperative
-            .whitelisted_tokens
-            .iter()
-            .position(|x| x.contract_addr == Some(token_out.clone()));
+        // Handle token transfer based on type
+        if w_token.is_native {
+            // Check if the contract has enough funds
+            let contract_balance = deps
+                .querier
+                .query_balance(env.contract.address.clone(), w_token.denom.clone())?;
 
-        if w_token_idx.is_none() {
-            return Err(ContractError::InvalidToken {});
-        }
-        let w_token = cooperative
-            .whitelisted_tokens
-            .get(w_token_idx.unwrap())
-            .unwrap();
-        let cw20_addr = w_token.clone().contract_addr;
+            if contract_balance.amount < amount_out {
+                return Err(ContractError::InsufficientPoolFunds {});
+            }
 
-        // For native tokens
-        if cw20_addr.is_none() {
+            // For native tokens
             messages.push(CosmosMsg::Bank(BankMsg::Send {
                 to_address: info.sender.to_string(),
                 amount: vec![Coin {
@@ -537,27 +536,54 @@ pub mod execute {
                     amount: amount_out,
                 }],
             }));
+        } else {
+            // For CW20 tokens
+            let cw20_addr = w_token
+                .contract_addr
+                .clone()
+                .ok_or(ContractError::InvalidToken {})?;
+
+            // Check contract balance
+            let balance: cw20::BalanceResponse = deps.querier.query_wasm_smart(
+                cw20_addr.clone(),
+                &cw20::Cw20QueryMsg::Balance {
+                    address: env.contract.address.to_string(),
+                },
+            )?;
+
+            if balance.balance < amount_out {
+                return Err(ContractError::InsufficientPoolFunds {});
+            }
+
+            // Create CW20 transfer message
+            messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: cw20_addr.to_string(),
+                msg: to_json_binary(&cw20::Cw20ExecuteMsg::Transfer {
+                    recipient: info.sender.to_string(),
+                    amount: amount_out,
+                })?,
+                funds: vec![],
+            }));
         }
 
-        // Create CW20 transfer message
-        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: cw20_addr.unwrap().to_string(),
-            msg: to_json_binary(&cw20::Cw20ExecuteMsg::TransferFrom {
-                owner: info.sender.to_string(),
-                recipient: env.contract.address.to_string(),
-                amount: amount_out,
-            })?,
-            funds: vec![],
-        }));
+        // Update member data
+        cooperative.members[member_idx].loans.push(loan);
 
-        cooperative.members[member_idx].active_loans.push(loan);
+        // Update state
+        state.current_loan_id += 1;
+
+        // Save updates
         COOPERATIVES.save(deps.storage, cooperative_name, &cooperative)?;
+        STATE.save(deps.storage, &state)?;
 
         Ok(Response::new()
             .add_messages(messages)
             .add_attribute("action", "borrow")
-            .add_attribute("token", "denom")
-            .add_attribute("amount_out", amount_out.to_string()))
+            .add_attribute("loan_id", loan_id.to_string())
+            .add_attribute("borrower", info.sender.to_string())
+            .add_attribute("token_out", token_out.to_string())
+            .add_attribute("amount_out", amount_out.to_string())
+            .add_attribute("collateral_value", collateral_value.to_string()))
     }
 
     pub fn execute_repay(
@@ -567,6 +593,7 @@ pub mod execute {
         cooperative_name: String,
         token: Addr,
     ) -> Result<Response, ContractError> {
+        // Normalize cooperative name
         let cooperative_name = cooperative_name.trim().to_lowercase();
         let mut cooperative = COOPERATIVES.load(deps.storage, cooperative_name.clone())?;
 
@@ -577,193 +604,227 @@ pub mod execute {
             .position(|m| m.address == info.sender)
             .ok_or(ContractError::MemberNotFound {})?;
 
-        // Find active loan
+        // Find active loan (for given token)
         let loan_idx = cooperative.members[member_idx]
-            .active_loans
+            .loans
             .iter()
-            .position(|l| l.status == LoanStatus::Active)
+            .position(|l| l.status == LoanStatus::Active && l.token == token)
             .ok_or(ContractError::NoActiveLoan {})?;
 
-        let loan = &mut cooperative.members[member_idx].active_loans[loan_idx];
-        loan.status = LoanStatus::Repaid;
+        let loan = cooperative.members[member_idx].loans[loan_idx].clone();
+        let repayment_amount = loan.amount;
 
-        let amount = loan.amount;
-
-        // find token
+        // Find token in whitelist
         let w_token_idx = cooperative
             .whitelisted_tokens
             .iter()
-            .position(|x| x.contract_addr == Some(token.clone()));
+            .position(|x| x.contract_addr == Some(token.clone()))
+            .ok_or(ContractError::InvalidToken {})?;
 
-        if w_token_idx.is_none() {
-            return Err(ContractError::InvalidToken {});
-        }
-        let w_token = cooperative
-            .whitelisted_tokens
-            .get(w_token_idx.unwrap())
-            .unwrap();
+        let w_token = &cooperative.whitelisted_tokens[w_token_idx];
 
-        // return collaterals
-        let collaterals = cooperative.members[member_idx].active_loans[loan_idx]
-            .collaterals
-            .clone();
-
-        for (idx, collateral) in collaterals.iter().enumerate() {
-            let token_id = TOKENS.load(deps.storage, collateral.clone())?;
-            let token_idx = cooperative
-                .whitelisted_tokens
-                .iter()
-                .position(|x| x.contract_addr == Some(collateral.clone()));
-            if token_idx.is_none() {
-                return Err(ContractError::InvalidToken {});
-            }
-            let bution_idx = cooperative.members[member_idx]
-                .contribution
-                .iter()
-                .position(|x| x.0 == token_id)
-                .unwrap();
-
-            let amount = cooperative.members[member_idx].contribution[bution_idx].1
-                + cooperative.members[member_idx].active_loans[loan_idx].collaterals_amount[idx];
-            cooperative.members[member_idx].contribution[bution_idx] =
-                (token_idx.unwrap() as u64, amount);
-        }
-
-        // transfer token back to contract
-        let mut messages: Vec<CosmosMsg> = vec![];
-
-        let sent_funds = info
-            .funds
-            .iter()
-            .find(|coin| coin.denom == w_token.denom)
-            .ok_or(ContractError::NoFunds {})?;
-
-        if sent_funds.amount != amount {
-            return Err(ContractError::InvalidFundAmount {});
-        }
-
-        // Handle token transfer based on type
+        // Validate payment
         if w_token.is_native {
             // For native tokens, verify sent funds
-            // Create bank transfer message
-            messages.push(CosmosMsg::Bank(BankMsg::Send {
-                to_address: env.contract.address.to_string(),
-                amount: vec![Coin {
-                    denom: w_token.denom.clone(),
-                    amount,
-                }],
-            }));
+            let sent_funds = info
+                .funds
+                .iter()
+                .find(|coin| coin.denom == w_token.denom)
+                .ok_or(ContractError::NoFunds {})?;
+
+            if sent_funds.amount != repayment_amount {
+                return Err(ContractError::InvalidFundAmount {});
+            }
         } else {
-            // For CW20 tokens
+            // For CW20 tokens, validate allowance first
             let cw20_addr = w_token
-                .clone()
                 .contract_addr
+                .clone()
                 .ok_or(ContractError::InvalidToken {})?;
 
-            // Create CW20 transfer message
+            // Check allowance
+            let allowance: cw20::AllowanceResponse = deps.querier.query_wasm_smart(
+                cw20_addr.clone(),
+                &cw20::Cw20QueryMsg::Allowance {
+                    owner: info.sender.to_string(),
+                    spender: env.contract.address.to_string(),
+                },
+            )?;
+
+            if allowance.allowance < repayment_amount {
+                return Err(ContractError::InsufficientAllowance {});
+            }
+        }
+
+        // Return collaterals to the member's contribution
+        let collaterals = &loan.collaterals;
+        let collateral_amounts = &loan.collaterals_amount;
+
+        // Here's the fixed version of your loan repayment code with proper bounds checking
+        for (idx, collateral) in collaterals.iter().enumerate() {
+            // Add bounds check to prevent index out of bounds error
+            if idx >= collateral_amounts.len() {
+                return Err(ContractError::InvalidCollateral {
+                    msg: format!("Collateral amount missing for collateral at index {}", idx),
+                });
+            }
+
+            let token_id = TOKENS.load(deps.storage, collateral.clone())?;
+
+            // Find or create contribution entry
+            let contribution_idx = cooperative.members[member_idx]
+                .contribution
+                .iter()
+                .position(|x| x.0 == token_id);
+
+            if let Some(contrib_idx) = contribution_idx {
+                // Update existing contribution
+                cooperative.members[member_idx].contribution[contrib_idx].1 +=
+                    collateral_amounts[idx];
+            } else {
+                // Add new contribution
+                cooperative.members[member_idx]
+                    .contribution
+                    .push((token_id, collateral_amounts[idx]));
+            }
+        }
+
+        // Mark loan as repaid
+        cooperative.members[member_idx].loans[loan_idx].status = LoanStatus::Repaid;
+
+        // Handle token transfer based on type
+        let mut messages: Vec<CosmosMsg> = vec![];
+
+        if !w_token.is_native {
+            // For CW20 tokens
+            let cw20_addr = w_token
+                .contract_addr
+                .clone()
+                .ok_or(ContractError::InvalidToken {})?;
+
+            // Create CW20 transferFrom message
             messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
                 contract_addr: cw20_addr.to_string(),
-                msg: to_json_binary(&cw20::Cw20ExecuteMsg::TransferFrom {
-                    owner: env.contract.address.to_string(),
+                msg: to_json_binary(&Cw20ExecuteMsg::TransferFrom {
+                    owner: info.sender.to_string(),
                     recipient: env.contract.address.to_string(),
-                    amount,
+                    amount: repayment_amount,
                 })?,
                 funds: vec![],
             }));
         }
 
+        // Save updated cooperative data
         COOPERATIVES.save(deps.storage, cooperative_name, &cooperative)?;
 
         Ok(Response::new()
             .add_messages(messages)
             .add_attribute("action", "repay")
-            .add_attribute("amount", amount.to_string()))
+            .add_attribute("loan_id", loan.id.to_string())
+            .add_attribute("borrower", info.sender.to_string())
+            .add_attribute("token", token.to_string())
+            .add_attribute("amount", repayment_amount.to_string()))
     }
 
     pub fn withdraw_contribution_and_rewards(
         deps: DepsMut,
-        env: Env,
+        _env: Env,
         info: MessageInfo,
         cooperative_name: String,
         token: Addr,
     ) -> Result<Response, ContractError> {
+        // Normalize cooperative name
         let cooperative_name = cooperative_name.trim().to_lowercase();
         let mut cooperative = COOPERATIVES.load(deps.storage, cooperative_name.clone())?;
+
+        // Find member
         let member_idx = cooperative
             .members
             .iter()
             .position(|m| m.address == info.sender)
             .ok_or(ContractError::MemberNotFound {})?;
 
-        // find token
+        // Find token in whitelist
         let w_token_idx = cooperative
             .whitelisted_tokens
             .iter()
-            .position(|x| x.contract_addr == Some(token.clone()));
+            .position(|x| x.contract_addr == Some(token.clone()))
+            .ok_or(ContractError::InvalidToken {})?;
 
-        if w_token_idx.is_none() {
-            return Err(ContractError::InvalidToken {});
-        }
-        let w_token = cooperative
-            .whitelisted_tokens
-            .get(w_token_idx.unwrap())
-            .unwrap();
+        let w_token = &cooperative.whitelisted_tokens[w_token_idx];
 
+        // Find member's contribution for this token
         let contribution_idx = cooperative.members[member_idx]
             .contribution
             .iter()
-            .position(|x| x.0 == w_token_idx.unwrap() as u64);
-        let contribution =
-            &mut cooperative.members[member_idx].contribution[contribution_idx.unwrap()].clone();
-        let amount = contribution.1;
+            .position(|x| x.0 == w_token_idx as u64)
+            .ok_or(ContractError::NoContribution {})?;
+
+        // Get the amount to withdraw
+        let amount = cooperative.members[member_idx].contribution[contribution_idx].1;
+        if amount.is_zero() {
+            return Err(ContractError::NoContribution {});
+        }
 
         // Check if the total funds available in the cooperative are sufficient
-        let total_available_funds = cooperative.total_funds[w_token_idx.unwrap()].1;
+        let total_available_funds = cooperative
+            .total_funds
+            .iter()
+            .find(|(id, _)| *id == w_token_idx as u64)
+            .map(|(_, amount)| *amount)
+            .unwrap_or(Uint128::zero());
+
         if total_available_funds < amount {
             return Err(ContractError::InsufficientPoolFunds {});
         }
 
         // Calculate the member's share of rewards based on the current contribution
-        let total_pooled_funds = cooperative.total_funds[w_token_idx.unwrap()].1;
+        let total_pooled_funds = total_available_funds;
         let member_share = if total_pooled_funds.is_zero() {
             Uint128::zero()
         } else {
-            let rewards_pool_key = (cooperative_name.clone(), w_token_idx.unwrap() as u64);
+            let rewards_pool_key = (cooperative_name.clone(), w_token_idx as u64);
             let rewards_pool = REWARDS_POOLS.load(deps.storage, rewards_pool_key)?;
-            (contribution.1 * rewards_pool.total_rewards) / total_pooled_funds
+            (amount * rewards_pool.total_rewards) / total_pooled_funds
         };
 
         // Check if the member has sufficient rewards
-        let share = &mut cooperative.members[member_idx].share[w_token_idx.unwrap()];
+        if member_idx >= cooperative.members.len()
+            || w_token_idx >= cooperative.members[member_idx].share.len()
+        {
+            return Err(ContractError::InsufficientRewards {});
+        }
+
+        let share = &mut cooperative.members.clone()[member_idx].share[w_token_idx];
         if share.1 < member_share {
             return Err(ContractError::InsufficientRewards {});
         }
 
-        // Update contribution and share
-        contribution.1 = 0u128.into();
-        share.1 = 0u128.into();
+        // Update contribution to zero
+        cooperative.members[member_idx].contribution[contribution_idx].1 = Uint128::zero();
+
+        // Update share to zero
+        share.1 = Uint128::zero();
 
         // Update cooperative total funds
-        cooperative.total_funds[w_token_idx.unwrap()].1 -= amount;
+        let fund_idx = cooperative
+            .total_funds
+            .iter()
+            .position(|(id, _)| *id == w_token_idx as u64)
+            .ok_or(ContractError::InvalidToken {})?;
+
+        cooperative.total_funds[fund_idx].1 =
+            cooperative.total_funds[fund_idx].1.saturating_sub(amount);
 
         // Update the rewards pool's distributed rewards
-        let mut rewards_pool = REWARDS_POOLS.load(
-            deps.storage,
-            (cooperative_name.clone(), w_token_idx.unwrap() as u64),
-        )?;
+        let rewards_pool_key = (cooperative_name.clone(), w_token_idx as u64);
+        let mut rewards_pool = REWARDS_POOLS.load(deps.storage, rewards_pool_key.clone())?;
         rewards_pool.distributed_rewards += member_share;
-        REWARDS_POOLS.save(
-            deps.storage,
-            (cooperative_name.clone(), w_token_idx.unwrap() as u64),
-            &rewards_pool,
-        )?;
-
-        // Save updated cooperative data
-        COOPERATIVES.save(deps.storage, cooperative_name.clone(), &cooperative)?;
+        REWARDS_POOLS.save(deps.storage, rewards_pool_key, &rewards_pool)?;
 
         // Handle token transfer based on type
         let mut messages: Vec<CosmosMsg> = vec![];
-        if cooperative.whitelisted_tokens[w_token_idx.unwrap()].is_native {
+        if w_token.is_native {
             // For native tokens, create bank transfer message
             messages.push(CosmosMsg::Bank(BankMsg::Send {
                 to_address: info.sender.to_string(),
@@ -774,7 +835,7 @@ pub mod execute {
             }));
         } else {
             // For CW20 tokens
-            let cw20_addr = cooperative.whitelisted_tokens[w_token_idx.unwrap()]
+            let cw20_addr = w_token
                 .contract_addr
                 .clone()
                 .ok_or(ContractError::InvalidToken {})?;
@@ -782,21 +843,24 @@ pub mod execute {
             // Create CW20 transfer message
             messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
                 contract_addr: cw20_addr.to_string(),
-                msg: to_json_binary(&cw20::Cw20ExecuteMsg::TransferFrom {
-                    owner: env.contract.address.to_string(),
-                    recipient: env.contract.address.to_string(),
+                msg: to_json_binary(&cw20::Cw20ExecuteMsg::Transfer {
+                    recipient: info.sender.to_string(),
                     amount,
                 })?,
                 funds: vec![],
             }));
         }
 
+        // Save updated cooperative data once
         COOPERATIVES.save(deps.storage, cooperative_name, &cooperative)?;
 
         Ok(Response::new()
             .add_messages(messages)
-            .add_attribute("action", "repay")
-            .add_attribute("amount", amount.to_string()))
+            .add_attribute("action", "withdraw_contribution_and_rewards")
+            .add_attribute("member", info.sender.to_string())
+            .add_attribute("token", token.to_string())
+            .add_attribute("amount", amount.to_string())
+            .add_attribute("rewards", member_share.to_string()))
     }
 
     pub fn execute_propose(
@@ -877,7 +941,6 @@ pub mod execute {
         weight: Uint128,
         aye: bool,
     ) -> Result<Response, ContractError> {
-        let state = STATE.load(deps.storage)?;
         let cooperative_name = cooperative_name.trim().to_lowercase();
         let mut proposal = PROPOSALS.load(deps.storage, proposal_id)?;
 
@@ -893,7 +956,7 @@ pub mod execute {
 
         // Record vote
         let vote = Vote {
-            voter: info.sender,
+            voter: info.sender.clone(),
             conviction: weight,
             voted_at: env.block.time.seconds(),
         };
@@ -906,18 +969,6 @@ pub mod execute {
             proposal.nay_count += 1;
             proposal.nay_weights += weight.u128() as u64;
         }
-
-        let cw20_contract_addr = state.weight_token;
-        let transfer_msg = Cw20ExecuteMsg::Transfer {
-            recipient: env.contract.address.into_string(),
-            amount: weight,
-        };
-
-        let msg: Vec<CosmosMsg> = vec![CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: cw20_contract_addr.to_string(),
-            msg: to_json_binary(&transfer_msg)?,
-            funds: vec![],
-        })];
 
         // Check if proposal can be finalized
         if let Some(quorum) = proposal.quorum {
@@ -934,7 +985,6 @@ pub mod execute {
         PROPOSALS.save(deps.storage, proposal_id, &proposal)?;
 
         Ok(Response::new()
-            .add_messages(msg)
             .add_attribute("action", "vote")
             .add_attribute("cooperative_name", cooperative_name)
             .add_attribute("proposal_id", proposal_id.to_string()))
@@ -942,7 +992,7 @@ pub mod execute {
 
     pub fn execute_withdraw_weight(
         deps: DepsMut,
-        env: Env,
+        _env: Env,
         info: MessageInfo,
         cooperative_name: String,
         proposal_id: u64,
@@ -965,16 +1015,12 @@ pub mod execute {
 
         let weight = weight.unwrap().conviction;
 
-        let cw20_contract_addr = state.weight_token;
-        let transfer_msg = Cw20ExecuteMsg::Transfer {
-            recipient: env.contract.address.into_string(),
-            amount: weight,
-        };
-
-        let msg: Vec<CosmosMsg> = vec![CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: cw20_contract_addr.to_string(),
-            msg: to_json_binary(&transfer_msg)?,
-            funds: vec![],
+        let msg: Vec<CosmosMsg> = vec![CosmosMsg::Bank(BankMsg::Send {
+            to_address: info.sender.to_string(),
+            amount: vec![Coin {
+                denom: state.weight_token,
+                amount: weight,
+            }],
         })];
 
         // Update weight to prevent double spending
@@ -1155,7 +1201,7 @@ pub mod execute {
             share: vec![],
             joined_at: env.block.time.seconds(),
             reputation_score: Decimal::zero(),
-            active_loans: vec![],
+            loans: vec![],
         };
 
         cooperative.members.push(new_member);
@@ -1188,27 +1234,35 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             cooperative_name,
             member,
         } => to_json_binary(&query::get_member_info(deps, cooperative_name, member)?),
+        QueryMsg::MemberContributionAndShare {
+            cooperative_name,
+            member_address,
+        } => to_json_binary(&query::query_member_contribution_and_share(
+            deps,
+            cooperative_name,
+            member_address.to_string(),
+        )?),
         QueryMsg::GetProposal { proposal_id } => {
             to_json_binary(&query::get_proposal(deps, proposal_id)?)
         }
         QueryMsg::GetWhitelistedTokens { cooperative_name } => {
             to_json_binary(&query::get_whitelisted_tokens(deps, cooperative_name)?)
         }
-        QueryMsg::ListCooperatives { min, max } => {
-            to_json_binary(&query::list_cooperative(deps, min, max)?)
-        }
+        QueryMsg::ListCooperatives {} => to_json_binary(&query::list_cooperative(deps)?),
         QueryMsg::GetTokenId { token } => to_json_binary(&query::get_token_id(deps, token)?),
     }
 }
 
 pub mod query {
-
     use cosmwasm_std::StdError;
-    use cw_storage_plus::Bound;
 
-    use crate::msg::{
-        GetCooperativeResponse, GetListCooperativesResponse, GetMemberInfoResponse,
-        GetProposalResponse, GetTokenIdResponse, GetWhitelistedTokensResponse,
+    use crate::{
+        msg::{
+            GetCooperativeResponse, GetListCooperativesResponse, GetMemberInfoResponse,
+            GetProposalResponse, GetTokenIdResponse, GetWhitelistedTokensResponse,
+            MemberContributionAndShareResponse, TokenAmount, TokenInfo,
+        },
+        state::WhitelistedTokenId,
     };
 
     use super::*;
@@ -1241,7 +1295,7 @@ pub mod query {
                     share: vec![],
                     joined_at: 0,
                     reputation_score: Decimal::zero(),
-                    active_loans: vec![],
+                    loans: vec![],
                 },
             });
         }
@@ -1257,13 +1311,129 @@ pub mod query {
                     share: vec![],
                     joined_at: 0,
                     reputation_score: Decimal::zero(),
-                    active_loans: vec![],
+                    loans: vec![],
                 },
             });
         }
 
         let info = member_data.unwrap();
         Ok(GetMemberInfoResponse { info: info.clone() })
+    }
+
+    pub fn query_member_contribution_and_share(
+        deps: Deps,
+        cooperative_name: String,
+        member_address: String,
+    ) -> StdResult<MemberContributionAndShareResponse> {
+        let cooperative_name = cooperative_name.trim().to_lowercase();
+        let member_addr = deps.api.addr_validate(&member_address)?;
+
+        // Get the cooperative
+        let cooperative = COOPERATIVES.load(deps.storage, cooperative_name.clone())?;
+
+        // Find the member in the cooperative
+        let member = cooperative
+            .members
+            .iter()
+            .find(|m| m.address == member_addr)
+            .ok_or_else(|| {
+                cosmwasm_std::StdError::generic_err(format!(
+                    "Member {} not found in cooperative {}",
+                    member_address, cooperative_name
+                ))
+            })?;
+
+        // Collect token information for all tokens in the cooperative
+        let mut token_info: Vec<TokenInfo> = Vec::new();
+        for token in &cooperative.whitelisted_tokens {
+            let token_id = if token.is_native {
+                TOKENS.load(deps.storage, Addr::unchecked("NATIVE"))?
+            } else {
+                TOKENS.load(deps.storage, token.contract_addr.as_ref().unwrap().clone())?
+            };
+
+            token_info.push(TokenInfo {
+                token_id,
+                denom: token.denom.clone(),
+                contract_addr: token.contract_addr.as_ref().map(|addr| addr.to_string()),
+                is_native: token.is_native,
+                symbol: None,
+                name: Some(token.denom.clone()),
+            });
+        }
+
+        // Convert member contributions to TokenAmount format
+        let contributions: Vec<TokenAmount> = member
+            .contribution
+            .iter()
+            .map(|(token_id, amount)| TokenAmount {
+                token_id: *token_id,
+                amount: *amount,
+                symbol: None,
+                name: None,
+            })
+            .collect();
+
+        // Calculate up-to-date shares for each token the member has contributed to
+        let mut calculated_shares: Vec<(WhitelistedTokenId, Uint128)> = Vec::new();
+
+        for &(token_id, contribution_amount) in &member.contribution {
+            // Get the total funds for this token in the cooperative (including accumulated interest)
+            let total_token_funds = cooperative
+                .total_funds
+                .iter()
+                .find(|(t_id, _)| t_id == &token_id)
+                .map(|(_, amount)| *amount)
+                .unwrap_or(Uint128::zero());
+
+            // If there are no funds for this token, share is zero
+            if total_token_funds.is_zero() {
+                calculated_shares.push((token_id, Uint128::zero()));
+                continue;
+            }
+
+            // Calculate the sum of all member contributions for this token
+            let total_member_contributions_for_token: Uint128 = cooperative
+                .members
+                .iter()
+                .flat_map(|m| m.contribution.iter())
+                .filter_map(|&(t_id, amount)| if t_id == token_id { Some(amount) } else { None })
+                .sum();
+
+            // Calculate the member's percentage of contributions
+            // Use Decimal for precise percentage calculation
+            let contribution_percentage = if !total_member_contributions_for_token.is_zero() {
+                Decimal::from_ratio(contribution_amount, total_member_contributions_for_token)
+            } else {
+                Decimal::zero()
+            };
+
+            // Calculate member's share of the total funds (including interest)
+            // Share = (member's contribution percentage) * total cooperative funds for this token
+            let share_amount = contribution_percentage.to_uint_ceil() * total_token_funds;
+
+            calculated_shares.push((token_id, share_amount));
+        }
+
+        // Convert calculated shares to TokenAmount format
+        let shares: Vec<TokenAmount> = calculated_shares
+            .iter()
+            .map(|(token_id, amount)| TokenAmount {
+                token_id: *token_id,
+                amount: *amount,
+                symbol: None,
+                name: None,
+            })
+            .collect();
+
+        Ok(MemberContributionAndShareResponse {
+            member_address,
+            cooperative_name,
+            contributions,
+            shares,
+            loans: member.loans.clone(),
+            token_info,
+        })
     }
 
     pub fn get_proposal(deps: Deps, proposal_id: u64) -> StdResult<GetProposalResponse> {
@@ -1283,18 +1453,9 @@ pub mod query {
         Ok(GetWhitelistedTokensResponse { tokens })
     }
 
-    pub fn list_cooperative(
-        deps: Deps,
-        min: String,
-        max: String,
-    ) -> StdResult<GetListCooperativesResponse> {
+    pub fn list_cooperative(deps: Deps) -> StdResult<GetListCooperativesResponse> {
         let cooperatives = COOPERATIVES
-            .keys(
-                deps.storage,
-                Some(Bound::inclusive(min)),
-                Some(Bound::inclusive(max)),
-                Order::Descending,
-            )
+            .keys(deps.storage, None, None, Order::Descending)
             .collect::<Result<Vec<String>, StdError>>()?;
 
         Ok(GetListCooperativesResponse { cooperatives })

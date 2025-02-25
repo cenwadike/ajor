@@ -4,7 +4,7 @@ import { GasPrice } from "@cosmjs/stargate";
 
 // Constants
 const RPC_ENDPOINT = "https://rpc-palvus.pion-1.ntrn.tech"; // Neutron RPC endpoint
-const CONTRACT_ADDRESS = "neutron1lf2ujetj5dcs4l874jeefdp9nngkquauk2qav5zvpmrzh63xs4rqyu7hcv"; 
+const CONTRACT_ADDRESS = "neutron16qhawx7cy6cmte2jluu39d6j09emzml5yvmhdglyz0re99v6wpms0rh63m"; 
 
 // Main class for interacting with the cooperative contract
 class CooperativeClient {
@@ -51,7 +51,7 @@ class CooperativeClient {
     
     const msg = {
       update_token_price: {
-        token_addr: tokenAddr,
+        token_addr: tokenAddr.toString(),
         usd_price: usdPrice.toString(),
       },
     };
@@ -276,12 +276,29 @@ class CooperativeClient {
     };
 
     try {
-      const result = await this.client.execute(
-        this.address,
-        CONTRACT_ADDRESS,
-        msg,
-        "auto"
-      );
+      let result;
+      if (weight > 0) {
+        result = await this.client.execute(
+          this.address,
+          CONTRACT_ADDRESS,
+          msg,
+          "auto",
+          "",
+          [
+            {
+              denom: "untrn",
+              amount: weight
+            }
+          ]
+        );
+      } else {
+        result = await this.client.execute(
+          this.address,
+          CONTRACT_ADDRESS,
+          msg,
+          "auto",
+        );        
+      }
       
       console.log("Vote cast:", result);
       return result;
@@ -387,8 +404,9 @@ class CooperativeClient {
     }
   }
 
-
-  // Increase allowance for CW20 tokens
+  /**
+   * Increase allowance for CW20 tokens
+   */
   async increaseAllowance(
     cw20TokenContract,
     spender,
@@ -404,14 +422,18 @@ class CooperativeClient {
         }
     };
 
-    return await this.client.execute(
-        this.address,
-        cw20TokenContract,
-        msg,
-        "auto",
-        undefined,
-        funds
-    );
+    try {
+      return await this.client.execute(
+          this.address,
+          cw20TokenContract,
+          msg,
+          "auto",
+          undefined,
+          funds
+      );
+    } catch (error) {
+      console.error("Failed to increase allowance")
+    }
   }
 
 
@@ -460,17 +482,33 @@ class CooperativeClient {
     }
   }
 
-  /**
-   * List all cooperatives
-   */
-  async listCooperatives(min = "", max = "") {
+  async getMemberInfoAndShare(cooperativeName, memberAddress) {
     if (!this.client) throw new Error("Client not initialized");
     
     const query = {
-      list_cooperatives: {
-        min,
-        max,
+      member_contribution_and_share: {
+        cooperative_name: cooperativeName,
+        member_address: memberAddress,
       },
+    };
+
+    try {
+      const result = await this.client.queryContractSmart(CONTRACT_ADDRESS, query);
+      return result;
+    } catch (error) {
+      console.error("Failed to get member contribution and shares:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * List all cooperatives
+   */
+  async listCooperatives() {
+    if (!this.client) throw new Error("Client not initialized");
+    
+    const query = {
+      list_cooperatives: {},
     };
 
     try {
@@ -561,7 +599,7 @@ const runExample = async () => {
       const mnemonic = process.env.MNEMONIC
       const client = new CooperativeClient(mnemonic);
       await client.connect();
-      
+
       // Example: Create a cooperative
       const riskProfile = {
           interest_rate: "0.05", // 5%
@@ -593,17 +631,15 @@ const runExample = async () => {
           }
       ];
       
-      const result = await client.createCooperative(
-          "My Cooperative",
-          riskProfile,
-          initialMembers,
-          initialWhitelistedTokens
-      );
-      
-      console.log("Cooperative created successfully:", result);
-      
-      // Example: Fund a cooperative
-      const fundNativeResult = await client.fundCooperative(
+      // await client.createCooperative(
+      //     "My Cooperative",
+      //     riskProfile,
+      //     initialMembers,
+      //     initialWhitelistedTokens
+      // );     
+
+      // Example: Fund a cooperative with native token
+      await client.fundCooperative(
           "My Cooperative",
           "untrn",
           true,
@@ -615,26 +651,22 @@ const runExample = async () => {
             }
           ]
       );
-      
-      console.log("Cooperative funded with native successfully:", fundNativeResult);
 
+      // Example: Fund a cooperative with cw20 token
       // increase tATOM allowance 
-      let atomAllowanceRes = await client.increaseAllowance(
+      await client.increaseAllowance(
         "neutron1sr60e2velepytzsdyuutcmccl9n2p2lu3pjcggllxyc9rzyu562sqegazj", 
         CONTRACT_ADDRESS, 
-        "1"
+        "200"
       );
-      console.log("Increase Allowance Transaction Result:", atomAllowanceRes);
 
-      const fundCw20Result = await client.fundCooperative(
+      await client.fundCooperative(
           "My Cooperative",
           "neutron1sr60e2velepytzsdyuutcmccl9n2p2lu3pjcggllxyc9rzyu562sqegazj",
           false,
-          "1",
+          "200",
           []
       );
-    
-      console.log("Cooperative funded with CW20 successfully:", fundCw20Result);
       
       // Example: Create a proposal to whitelist a new token
       const proposal = {
@@ -651,17 +683,51 @@ const runExample = async () => {
           nay_count: 0,
           aye_weights: 0,
           nay_weights: 0,
-          end_time: Math.floor(Date.now() / 1000) + 604800, // 1 week from now
+          end_time: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7), // 1 week from now
           proposal_type: "WhitelistToken",
           executed: false
       };
       
-      const proposeResult = await client.propose(
+      await client.propose(
           "My Cooperative",
           proposal
       );
       
-      console.log("Proposal created successfully:", proposeResult);
+      // Example: Vote on proposal to whitelist a new token
+      await client.vote(
+        "My Cooperative",
+        1,
+        "0",
+        true
+      );
+
+      // Example: Update token price
+      await client.updateTokenPrice(
+        "neutron1sr60e2velepytzsdyuutcmccl9n2p2lu3pjcggllxyc9rzyu562sqegazj",
+        4.5
+      )
+
+      // Example: Take a loan
+      await client.borrow(
+        "My Cooperative",
+        ["neutron1sr60e2velepytzsdyuutcmccl9n2p2lu3pjcggllxyc9rzyu562sqegazj"],
+        ["1"],
+        "neutron1sr60e2velepytzsdyuutcmccl9n2p2lu3pjcggllxyc9rzyu562sqegazj",
+        "0"
+      );
+
+      // Example: Repay loan
+      // increase tATOM allowance 
+      await client.increaseAllowance(
+        "neutron1sr60e2velepytzsdyuutcmccl9n2p2lu3pjcggllxyc9rzyu562sqegazj", 
+        CONTRACT_ADDRESS, 
+        "2"
+      );
+
+      await client.repay(
+        "My Cooperative",
+        "neutron1sr60e2velepytzsdyuutcmccl9n2p2lu3pjcggllxyc9rzyu562sqegazj"
+      );
     
   } catch (error) {
       console.error("Error in example:", error);

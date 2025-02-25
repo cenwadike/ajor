@@ -49,7 +49,7 @@ pub struct Member {
     pub share: Vec<(WhitelistedTokenId, Uint128)>,
     pub joined_at: u64,
     pub reputation_score: Decimal,
-    pub active_loans: Vec<Loan>, // User loans
+    pub loans: Vec<Loan>, // User loans
 }
 
 // Cooperative risk profile
@@ -146,7 +146,7 @@ pub enum ProposalOutcome {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct Price {
-    pub latest_price_to_usd: Uint128,
+    pub latest_price_to_usd: Decimal,
     pub last_updated_at: Timestamp,
 }
 

@@ -36,6 +36,12 @@ pub enum ContractError {
     #[error("Invalid token")]
     InvalidToken {},
 
+    #[error("Invalid input")]
+    InvalidInput {},
+
+    #[error("Invalid collateral")]
+    InvalidCollateral { msg: String },
+
     #[error("Max whitelisted tokens reached")]
     MaxWhitelistedTokensReached {},
 
@@ -45,11 +51,17 @@ pub enum ContractError {
     #[error("Insufficient funds")]
     InsufficientFunds {},
 
+    #[error("Insufficient allowance")]
+    InsufficientAllowance {},
+
     #[error("Insufficient collateral")]
     InsufficientCollateral {},
 
     #[error("No active loan")]
     NoActiveLoan {},
+
+    #[error("No contribution")]
+    NoContribution {},
 
     #[error("Loan ratio exceeded")]
     LoanRatioExceeded {},
